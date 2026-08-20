@@ -14,10 +14,10 @@ import serial.tools.list_ports
 
 
 # =============================================================================
-# 1. CAMERA THREAD WORKER
+# 1. THREADED CAMERA STREAM
 # =============================================================================
 class CameraStream:
-    """Threaded camera capture for smooth UI frame processing."""
+    """Threaded camera capture to prevent UI freezing."""
     def __init__(self, src=0):
         if str(src).isdigit():
             src = int(src)
@@ -30,11 +30,11 @@ class CameraStream:
         if self.started:
             return self
         self.started = True
-        self.thread = threading.Thread(target=self.update, args=(), daemon=True)
+        self.thread = threading.Thread(target=self._update, daemon=True)
         self.thread.start()
         return self
 
-    def update(self):
+    def _update(self):
         while self.started:
             grabbed, frame = self.cap.read()
             with self.read_lock:
@@ -44,7 +44,7 @@ class CameraStream:
 
     def read(self):
         with self.read_lock:
-            return self.grabbed, self.frame.copy() if self.frame is not None else None
+            return self.grabbed, (self.frame.copy() if self.frame is not None else None)
 
     def stop(self):
         self.started = False
@@ -55,7 +55,7 @@ class CameraStream:
 
 
 # =============================================================================
-# 2. BUILT-IN DETECTOR LOGIC (Laplacian V1)
+# 2. BUILT-IN DETECTOR LOGIC (Laplacian Defect Inspection)
 # =============================================================================
 def detect_laplacian_v1(img, k_multiplier=3.0, ksize=3):
     if len(img.shape) == 3:
@@ -63,7 +63,11 @@ def detect_laplacian_v1(img, k_multiplier=3.0, ksize=3):
     else:
         gray = img.copy()
 
-    laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=int(ksize))
+    ksize = int(ksize)
+    if ksize not in [1, 3, 5, 7]:
+        ksize = 3
+
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=ksize)
     laplacian_abs = cv2.convertScaleAbs(laplacian)
 
     mean_val, std_dev = cv2.meanStdDev(laplacian_abs)
@@ -82,7 +86,7 @@ def detect_laplacian_v1(img, k_multiplier=3.0, ksize=3):
 
 
 # =============================================================================
-# 3. MAIN APPLICATION GUI
+# 3. MAIN INSPECTION APPLICATION
 # =============================================================================
 class VisionInspectionApp:
     def __init__(self, root):
@@ -91,43 +95,38 @@ class VisionInspectionApp:
         self.root.geometry("1440x880")
         self.root.minsize(1100, 750)
 
-        # Apply Modern Dark Theme
-        self._apply_theme()
+        self._apply_dark_theme()
 
-        # Serial & Camera State
         self.ser = None
         self.cam = None
 
-        # Algorithm Plugins
+        # Algorithm Management
         self.algorithms = {}
         self.load_algorithms()
 
-        # Transformation State
+        # Canvas Zoom, Pan & ROI States
         self.zoom_level = 1.0
         self.pan_x = 0
         self.pan_y = 0
         self.last_mouse_x = 0
         self.last_mouse_y = 0
 
-        # ROI State in Frame Coordinates: (x1, y1, x2, y2)
         self.roi = None
         self.is_drawing_roi = False
         self.roi_screen_start = None
         self.roi_screen_current = None
-
         self.current_raw_frame = None
 
         self._build_layout()
         self.update_loop()
 
-    def _apply_theme(self):
+    def _apply_dark_theme(self):
         style = ttk.Style()
         style.theme_use("clam")
         
-        # Color Palette
         bg_dark = "#1e1e24"
         panel_bg = "#2b2b36"
-        accent_color = "#007acc"
+        accent_blue = "#007acc"
         fg_white = "#e0e0e0"
 
         self.root.configure(bg=bg_dark)
@@ -137,10 +136,19 @@ class VisionInspectionApp:
         style.configure("TLabelframe", background=panel_bg, foreground="#61afef", font=("Segoe UI", 10, "bold"))
         style.configure("TLabelframe.Label", background=panel_bg, foreground="#61afef")
         style.configure("TLabel", background=panel_bg, foreground=fg_white)
-        style.configure("TButton", background="#3e4451", foreground="white", borderwidth=0, focuscolor="none", padding=5)
-        style.map("TButton", background=[("active", accent_color)])
-        style.configure("Accent.TButton", background=accent_color, foreground="white", font=("Segoe UI", 9, "bold"))
+        
+        style.configure("TButton", background="#3e4451", foreground="white", borderwidth=0, padding=5)
+        style.map("TButton", background=[("active", accent_blue)])
+        
+        style.configure("Accent.TButton", background=accent_blue, foreground="white", font=("Segoe UI", 9, "bold"))
         style.map("Accent.TButton", background=[("active", "#005f9e")])
+        
+        style.configure("Green.TButton", background="#28a745", foreground="white", font=("Segoe UI", 9, "bold"))
+        style.map("Green.TButton", background=[("active", "#1e7e34")])
+
+        style.configure("Red.TButton", background="#dc3545", foreground="white", font=("Segoe UI", 9, "bold"))
+        style.map("Red.TButton", background=[("active", "#bd2130")])
+
         style.configure("TCombobox", fieldbackground="#1e1e24", background="#3e4451", foreground="white")
         style.configure("TEntry", fieldbackground="#1e1e24", foreground="white")
 
@@ -148,23 +156,26 @@ class VisionInspectionApp:
         main_paned = ttk.PanedWindow(self.root, orient="horizontal")
         main_paned.pack(fill="both", expand=True)
 
-        # ---------------- LEFT PANEL (CANVAS & TOOLBAR) ----------------
+        # Left Panel (Display Canvas)
         left_frame = ttk.Frame(main_paned)
         main_paned.add(left_frame, weight=4)
 
         toolbar = ttk.Frame(left_frame, padding=6)
         toolbar.pack(fill="x", side="top")
 
-        ttk.Button(toolbar, text="Reset View", command=self.reset_zoom).pack(side="left", padx=4)
+        ttk.Button(toolbar, text="Reset Zoom & Pan", command=self.reset_zoom).pack(side="left", padx=4)
         ttk.Button(toolbar, text="Clear ROI", command=self.clear_roi).pack(side="left", padx=4)
         
-        self.lbl_info = ttk.Label(toolbar, text="[Left Drag]: Draw ROI  |  [Right Drag]: Pan  |  [Scroll]: Zoom", foreground="#98c379")
-        self.lbl_info.pack(side="right", padx=10)
+        ttk.Label(
+            toolbar, 
+            text="[Left Drag]: Draw ROI  |  [Right Drag]: Pan  |  [Scroll]: Zoom", 
+            foreground="#98c379"
+        ).pack(side="right", padx=10)
 
         self.canvas = tk.Canvas(left_frame, bg="#121214", highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
 
-        # Mouse Bindings
+        # Mouse Event Bindings
         self.canvas.bind("<MouseWheel>", self.on_zoom)
         self.canvas.bind("<Button-4>", self.on_zoom)
         self.canvas.bind("<Button-5>", self.on_zoom)
@@ -176,7 +187,7 @@ class VisionInspectionApp:
         self.canvas.bind("<ButtonPress-3>", self.on_pan_start)
         self.canvas.bind("<B3-Motion>", self.on_pan_drag)
 
-        # ---------------- RIGHT PANEL (CONTROLS) ----------------
+        # Right Panel (Controls)
         right_container = ttk.Frame(main_paned)
         main_paned.add(right_container, weight=1)
 
@@ -184,11 +195,7 @@ class VisionInspectionApp:
         scrollbar = ttk.Scrollbar(right_container, orient="vertical", command=right_canvas.yview)
         self.scroll_frame = ttk.Frame(right_canvas, padding=12)
 
-        self.scroll_frame.bind(
-            "<Configure>",
-            lambda e: right_canvas.configure(scrollregion=right_canvas.bbox("all"))
-        )
-
+        self.scroll_frame.bind("<Configure>", lambda e: right_canvas.configure(scrollregion=right_canvas.bbox("all")))
         right_canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
         right_canvas.configure(yscrollcommand=scrollbar.set)
 
@@ -203,7 +210,7 @@ class VisionInspectionApp:
         cam_frame = ttk.LabelFrame(self.scroll_frame, text=" Camera Controls ", padding=10)
         cam_frame.pack(fill="x", pady=6)
 
-        ttk.Label(cam_frame, text="Source ID / RTSP:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(cam_frame, text="Source Index / Stream:").grid(row=0, column=0, sticky="w", pady=4)
         self.ent_cam_src = ttk.Entry(cam_frame, width=10)
         self.ent_cam_src.insert(0, "0")
         self.ent_cam_src.grid(row=0, column=1, padx=5, pady=4)
@@ -225,7 +232,7 @@ class VisionInspectionApp:
 
         ttk.Separator(algo_frame, orient="horizontal").grid(row=2, column=0, columnspan=3, sticky="ew", pady=8)
 
-        ttk.Label(algo_frame, text="k-Multiplier (Sensitivity):").grid(row=3, column=0, columnspan=2, sticky="w")
+        ttk.Label(algo_frame, text="Sensitivity Multiplier:").grid(row=3, column=0, columnspan=2, sticky="w")
         self.lbl_k_val = ttk.Label(algo_frame, text="3.0", foreground="#61afef", font=("Segoe UI", 9, "bold"))
         self.lbl_k_val.grid(row=3, column=2, sticky="e")
 
@@ -253,10 +260,27 @@ class VisionInspectionApp:
         self.baud_cb.set("19200")
         self.baud_cb.grid(row=0, column=3, padx=2, pady=2)
 
-        self.btn_connect = ttk.Button(conn_frame, text="Connect RS-232", style="Accent.TButton", command=self.toggle_serial_connection)
-        self.btn_connect.grid(row=1, column=0, columnspan=4, sticky="ew", pady=6)
+        ttk.Label(conn_frame, text="Protocol:").grid(row=1, column=0, padx=2, pady=4, sticky="w")
+        self.proto_cb = ttk.Combobox(
+            conn_frame,
+            values=["OPT (With Checksum)", "OPT (No Checksum)", "Standard ASCII (SA)"],
+            state="readonly",
+            width=18
+        )
+        self.proto_cb.set("OPT (With Checksum)")
+        self.proto_cb.grid(row=1, column=1, columnspan=3, sticky="ew", pady=4)
 
-        ctrl_frame = ttk.LabelFrame(self.scroll_frame, text=" Channel Brightness (0-255) ", padding=10)
+        self.btn_connect = ttk.Button(conn_frame, text="Connect RS-232", style="Accent.TButton", command=self.toggle_serial_connection)
+        self.btn_connect.grid(row=2, column=0, columnspan=4, sticky="ew", pady=4)
+
+        # Quick Test Buttons
+        btn_box = ttk.Frame(conn_frame)
+        btn_box.grid(row=3, column=0, columnspan=4, sticky="ew", pady=4)
+        ttk.Button(btn_box, text="TURN ON FULL (255)", style="Green.TButton", command=self.turn_all_lights_on).pack(side="left", fill="x", expand=True, padx=2)
+        ttk.Button(btn_box, text="TURN ALL OFF", style="Red.TButton", command=self.turn_all_lights_off).pack(side="right", fill="x", expand=True, padx=2)
+
+        # Sliders
+        ctrl_frame = ttk.LabelFrame(self.scroll_frame, text=" Brightness Adjust (0 - 255) ", padding=10)
         ctrl_frame.pack(fill="x", pady=6)
 
         self.sliders = []
@@ -283,13 +307,110 @@ class VisionInspectionApp:
             self.val_labels.append(val_label)
 
     # -------------------------------------------------------------------------
-    # DYNAMIC ALGORITHM PLUGIN ENGINE
+    # HARDWARE RS-232 COMMUNICATION PROTOCOL ENGINE
+    # -------------------------------------------------------------------------
+    def _calculate_xor_checksum(self, cmd_str):
+        chk = 0
+        for char in cmd_str:
+            chk ^= ord(char)
+        return f"{chk:02X}"
+
+    def _send_raw(self, cmd):
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.write(cmd.encode('ascii'))
+                self.ser.flush()
+            except Exception as e:
+                print(f"RS-232 Write Error: {e}")
+
+    def enable_channel(self, channel, state=True):
+        proto = self.proto_cb.get()
+        st_val = "1" if state else "0"
+
+        if "With Checksum" in proto:
+            payload = f"$1{channel}{st_val}"
+            cmd = f"{payload}{self._calculate_xor_checksum(payload)}\r\n"
+        elif "No Checksum" in proto:
+            cmd = f"$1{channel}{st_val}\r\n"
+        else:
+            cmd = f"@00L{channel}{'255' if state else '000'}\r\n"
+        self._send_raw(cmd)
+
+    def send_brightness(self, channel, val):
+        proto = self.proto_cb.get()
+        if "With Checksum" in proto:
+            payload = f"$3{channel}{val:03d}"
+            cmd = f"{payload}{self._calculate_xor_checksum(payload)}\r\n"
+        elif "No Checksum" in proto:
+            cmd = f"$3{channel}{val:03d}\r\n"
+        else:
+            ch_letter = chr(ord('A') + channel - 1)
+            cmd = f"S{ch_letter}{val:03d}\r\n"
+        self._send_raw(cmd)
+
+    def turn_all_lights_on(self):
+        for ch in range(1, 5):
+            self.enable_channel(ch, state=True)
+            time.sleep(0.02)
+            self.sliders[ch - 1].set(255)
+            self.send_brightness(ch, 255)
+            self.val_labels[ch - 1].config(text="255")
+
+    def turn_all_lights_off(self):
+        for ch in range(1, 5):
+            self.sliders[ch - 1].set(0)
+            self.send_brightness(ch, 0)
+            self.enable_channel(ch, state=False)
+            self.val_labels[ch - 1].config(text="000")
+
+    def on_slider_move(self, channel, val):
+        val_int = int(float(val))
+        self.val_labels[channel - 1].config(text=f"{val_int:03d}")
+        if val_int > 0:
+            self.enable_channel(channel, state=True)
+        self.send_brightness(channel, val_int)
+
+    def get_ports(self):
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        return ports if ports else ["COM1", "COM3", "/dev/ttyUSB0"]
+
+    def toggle_serial_connection(self):
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+            self.ser = None
+            self.btn_connect.config(text="Connect RS-232")
+            messagebox.showinfo("Status", "Port Closed.")
+        else:
+            port = self.port_cb.get()
+            baud = int(self.baud_cb.get())
+            if not port:
+                messagebox.showwarning("Warning", "Please select a COM port.")
+                return
+            try:
+                self.ser = serial.Serial(
+                    port=port,
+                    baudrate=baud,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=0.2,
+                    xonxoff=False,
+                    rtscts=False
+                )
+                self.btn_connect.config(text="Disconnect")
+                for ch in range(1, 5):
+                    self.enable_channel(ch, state=True)
+                messagebox.showinfo("Connected", f"Connected to {port} @ {baud} bps")
+            except Exception as e:
+                messagebox.showerror("Connection Error", str(e))
+
+    # -------------------------------------------------------------------------
+    # PLUGIN ENGINE & SENSITIVITY
     # -------------------------------------------------------------------------
     def load_algorithms(self):
         self.algorithms = {"Laplacian V1 (Built-in)": detect_laplacian_v1}
         algo_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "algorithms")
         os.makedirs(algo_dir, exist_ok=True)
-
         for file_path in glob.glob(os.path.join(algo_dir, "*.py")):
             filename = os.path.basename(file_path)
             if filename.startswith("__"):
@@ -303,15 +424,18 @@ class VisionInspectionApp:
                     algo_title = getattr(mod, "NAME", module_name)
                     self.algorithms[algo_title] = mod.process_frame
             except Exception as e:
-                print(f"Error loading plugin {filename}: {e}")
+                print(f"Plugin load error {filename}: {e}")
 
     def reload_algorithms_list(self):
         self.load_algorithms()
         self.algo_cb['values'] = list(self.algorithms.keys())
         messagebox.showinfo("Plugins", f"Loaded {len(self.algorithms)} algorithms.")
 
+    def _on_k_slider_move(self, val):
+        self.lbl_k_val.config(text=f"{float(val):.1f}")
+
     # -------------------------------------------------------------------------
-    # CAMERA CONTROLS
+    # CAMERA CONTROLS & CANVAS INTERACTIVITY
     # -------------------------------------------------------------------------
     def toggle_camera(self):
         if self.cam and self.cam.started:
@@ -326,72 +450,6 @@ class VisionInspectionApp:
             except Exception as e:
                 messagebox.showerror("Camera Error", f"Cannot open camera:\n{e}")
 
-    def _on_k_slider_move(self, val):
-        self.lbl_k_val.config(text=f"{float(val):.1f}")
-
-    # -------------------------------------------------------------------------
-    # SERIAL PROTOCOL LOGIC (RS232: 19200, 8, 1, NP, NF with OPT Checksum)
-    # -------------------------------------------------------------------------
-    def get_ports(self):
-        ports = [port.device for port in serial.tools.list_ports.comports()]
-        return ports if ports else ["COM1", "COM3", "/dev/ttyUSB0"]
-
-    def toggle_serial_connection(self):
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-            self.btn_connect.config(text="Connect RS-232")
-            messagebox.showinfo("Status", "Port closed.")
-        else:
-            port = self.port_cb.get()
-            baud = int(self.baud_cb.get())
-            if not port:
-                messagebox.showwarning("Warning", "Select a valid COM port.")
-                return
-            try:
-                # Standard RS-232: 8 Data bits, 1 Stop bit, No Parity (NP), No Flow control (NF)
-                self.ser = serial.Serial(
-                    port=port,
-                    baudrate=baud,
-                    bytesize=serial.EIGHTBITS,
-                    parity=serial.PARITY_NONE,
-                    stopbits=serial.STOPBITS_ONE,
-                    timeout=0.2,
-                    xonxoff=False,
-                    rtscts=False
-                )
-                self.btn_connect.config(text="Disconnect")
-                messagebox.showinfo("Connected", f"Connected to {port} @ {baud} bps")
-            except Exception as e:
-                messagebox.showerror("Connection Error", str(e))
-
-    def _calculate_opt_checksum(self, cmd_str):
-        """Computes XOR checksum for OPT controller protocol frames."""
-        chk = 0
-        for char in cmd_str:
-            chk ^= ord(char)
-        return f"{chk:02X}"
-
-    def send_command(self, channel, val):
-        """Sends channel brightness with XOR checksum format: $3<channel><val3digits><chk>\r\n"""
-        if self.ser and self.ser.is_open:
-            payload = f"$3{channel}{val:03d}"
-            checksum = self._calculate_opt_checksum(payload)
-            full_command = f"{payload}{checksum}\r\n"
-            
-            try:
-                self.ser.write(full_command.encode('ascii'))
-                self.ser.flush()
-            except Exception as e:
-                print(f"Serial write error: {e}")
-
-    def on_slider_move(self, channel, val):
-        val_int = int(float(val))
-        self.val_labels[channel - 1].config(text=f"{val_int:03d}")
-        self.send_command(channel, val_int)
-
-    # -------------------------------------------------------------------------
-    # CANVAS INTERACTION: ZOOM, PAN & ACCURATE ROI TRANSFORMATIONS
-    # -------------------------------------------------------------------------
     def reset_zoom(self):
         self.zoom_level = 1.0
         self.pan_x = 0
@@ -405,11 +463,6 @@ class VisionInspectionApp:
         ix = int((sx - self.pan_x) / self.zoom_level)
         iy = int((sy - self.pan_y) / self.zoom_level)
         return ix, iy
-
-    def img_to_screen_coords(self, ix, iy):
-        sx = int(ix * self.zoom_level + self.pan_x)
-        sy = int(iy * self.zoom_level + self.pan_y)
-        return sx, sy
 
     def on_zoom(self, event):
         zoom_factor = 1.15 if (getattr(event, 'num', 0) == 4 or getattr(event, 'delta', 0) > 0) else 0.85
@@ -447,15 +500,11 @@ class VisionInspectionApp:
         self.is_drawing_roi = False
         x1, y1 = self.screen_to_img_coords(self.roi_screen_start[0], self.roi_screen_start[1])
         x2, y2 = self.screen_to_img_coords(event.x, event.y)
-
         if abs(x2 - x1) > 8 and abs(y2 - y1) > 8:
             self.roi = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
         self.roi_screen_start = None
         self.roi_screen_current = None
 
-    # -------------------------------------------------------------------------
-    # VIDEO STREAM & DETECTION PIPELINE
-    # -------------------------------------------------------------------------
     def update_loop(self):
         if self.cam and self.cam.started:
             grabbed, frame = self.cam.read()
@@ -479,7 +528,10 @@ class VisionInspectionApp:
 
         selected_algo = self.algo_cb.get()
         algo_fn = self.algorithms.get(selected_algo, detect_laplacian_v1)
-        params = {'k_multiplier': float(self.scale_k.get()), 'ksize': int(self.ksize_cb.get())}
+        params = {
+            'k_multiplier': float(self.scale_k.get()),
+            'ksize': int(self.ksize_cb.get())
+        }
 
         if self.roi:
             x1, y1, x2, y2 = self.roi
@@ -517,7 +569,7 @@ class VisionInspectionApp:
         self.canvas.delete("all")
         self.canvas.create_image(self.pan_x, self.pan_y, anchor="nw", image=self.tk_img)
 
-        # Draw interactive ROI selection box dynamically on top of the canvas
+        # Draw ROI selection preview box dynamically on canvas
         if self.is_drawing_roi and self.roi_screen_start and self.roi_screen_current:
             x0, y0 = self.roi_screen_start
             x1, y1 = self.roi_screen_current
@@ -525,7 +577,7 @@ class VisionInspectionApp:
 
 
 # =============================================================================
-# MAIN ENTRY POINT
+# ENTRY POINT
 # =============================================================================
 if __name__ == "__main__":
     root = tk.Tk()
