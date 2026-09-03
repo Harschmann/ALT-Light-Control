@@ -288,8 +288,8 @@ class AltLightControllerGUI:
         checksum ^= last_val_plus_one
         
         msg.append(checksum)
-        msg.append(0xEE) # Footer
-        msg.append(0xEE) # Footer
+        msg.append(0xEE) 
+        msg.append(0xEE) 
         
         try:
             self.ser.write(msg)
