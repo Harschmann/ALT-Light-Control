@@ -78,6 +78,14 @@ class AltLightControllerGUI:
         mon_frame = ttk.LabelFrame(self.root, text=" Byte Monitor ", padding=8)
         mon_frame.pack(fill="both", padx=10, pady=(0, 5))
 
+        raw_row = ttk.Frame(mon_frame)
+        raw_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(raw_row, text="Send Raw Hex:").pack(side="left")
+        self.ent_raw_hex = ttk.Entry(raw_row)
+        self.ent_raw_hex.pack(side="left", fill="x", expand=True, padx=5)
+        self.ent_raw_hex.insert(0, "EF EF 00 FF FF FF FF FF EE EE")
+        ttk.Button(raw_row, text="Send", command=self.send_raw_hex).pack(side="left")
+
         self.txt_monitor = tk.Text(mon_frame, height=6, font=("Consolas", 8), wrap="none")
         self.txt_monitor.pack(fill="both", expand=True)
         self.txt_monitor.configure(state="disabled")
@@ -88,6 +96,22 @@ class AltLightControllerGUI:
         self.txt_monitor.configure(state="normal")
         self.txt_monitor.delete("1.0", "end")
         self.txt_monitor.configure(state="disabled")
+
+    def send_raw_hex(self):
+        if not (self.ser and self.ser.is_open):
+            messagebox.showwarning("Not Connected", "Connect to the port first.")
+            return
+        text = self.ent_raw_hex.get().strip()
+        try:
+            hex_bytes = bytes(int(b, 16) for b in text.split())
+        except ValueError:
+            messagebox.showerror("Bad Input", "Enter space-separated hex bytes, e.g.\nEF EF 00 FF FF FF FF FF EE EE")
+            return
+        try:
+            self.ser.write(hex_bytes)
+            self.log_monitor(hex_bytes, "TX")
+        except Exception as e:
+            messagebox.showerror("Write Error", str(e))
 
     def log_monitor(self, raw_bytes, tag):
         ts = time.strftime("%H:%M:%S")
