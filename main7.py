@@ -43,6 +43,41 @@ class TcpTransport:
             pass
 
 
+class UdpTransport:
+    """
+    Same interface as TcpTransport, but over UDP. ALTSYSTEM's spec mentions
+    the Ethernet interface supporting BOTH TCP/IP and UDP -- a successful TCP
+    connect only proves that port accepts TCP connections, not that it's the
+    actual light-control command channel. This lets that be tested too,
+    without any code, in case the real command path is UDP datagrams.
+    """
+    def __init__(self, ip, port, timeout=0.2):
+        self.ip = ip
+        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(timeout)
+        self.is_open = True
+
+    def write(self, data):
+        self.sock.sendto(data, (self.ip, self.port))
+
+    def read(self, n):
+        try:
+            data, _ = self.sock.recvfrom(n)
+            return data if data else b""
+        except socket.timeout:
+            return b""
+        except OSError:
+            return b""
+
+    def close(self):
+        self.is_open = False
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
 
 class AltLightControllerGUI:
     def __init__(self, root):
@@ -80,7 +115,7 @@ class AltLightControllerGUI:
         self.conn_type = tk.StringVar(value="Ethernet (TCP)")
         self.conn_type_cb = ttk.Combobox(
             type_row, textvariable=self.conn_type,
-            values=["Ethernet (TCP)", "Serial (RS-232)"], state="readonly", width=16
+            values=["Ethernet (TCP)", "Ethernet (UDP)", "Serial (RS-232)"], state="readonly", width=16
         )
         self.conn_type_cb.pack(side="left", padx=5)
         self.conn_type_cb.bind("<<ComboboxSelected>>", lambda e: self.on_conn_type_change())
@@ -249,13 +284,20 @@ class AltLightControllerGUI:
             messagebox.showinfo("Status", "Disconnected from device.")
         else:
             try:
-                if self.conn_type.get().startswith("Ethernet"):
+                if self.conn_type.get() == "Ethernet (TCP)":
                     ip = self.ip_entry.get().strip()
                     tcp_port = int(self.tcp_port_entry.get().strip())
                     if not ip:
                         messagebox.showwarning("Error", "Please enter the controller's IP address.")
                         return
                     self.ser = TcpTransport(ip, tcp_port, timeout=0.2)
+                elif self.conn_type.get() == "Ethernet (UDP)":
+                    ip = self.ip_entry.get().strip()
+                    udp_port = int(self.tcp_port_entry.get().strip())
+                    if not ip:
+                        messagebox.showwarning("Error", "Please enter the controller's IP address.")
+                        return
+                    self.ser = UdpTransport(ip, udp_port, timeout=0.2)
                 else:
                     port = self.port_cb.get()
                     baud = self.baud_cb.get()
