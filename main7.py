@@ -1,6 +1,8 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import time
+import threading
+import queue
 import serial
 import serial.tools.list_ports
 
@@ -22,6 +24,10 @@ class AltLightControllerGUI:
         # UI doesn't freeze the way a literal time.sleep() in the callback would).
         self._last_send_time = 0.0
         self._pending_after_id = None
+
+        self.rx_queue = queue.Queue()
+        self.reader_thread = None
+        self.reader_running = False
 
         self.setup_ui()
 
@@ -68,6 +74,71 @@ class AltLightControllerGUI:
         self.val_labels = []
         self.build_sliders()
 
+        # --- Byte Monitor (see exactly what's really going out / coming back) ---
+        mon_frame = ttk.LabelFrame(self.root, text=" Byte Monitor ", padding=8)
+        mon_frame.pack(fill="both", padx=10, pady=(0, 5))
+
+        self.txt_monitor = tk.Text(mon_frame, height=6, font=("Consolas", 8), wrap="none")
+        self.txt_monitor.pack(fill="both", expand=True)
+        self.txt_monitor.configure(state="disabled")
+
+        ttk.Button(mon_frame, text="Clear", command=self.clear_monitor).pack(anchor="e", pady=(4, 0))
+
+    def clear_monitor(self):
+        self.txt_monitor.configure(state="normal")
+        self.txt_monitor.delete("1.0", "end")
+        self.txt_monitor.configure(state="disabled")
+
+    def log_monitor(self, raw_bytes, tag):
+        ts = time.strftime("%H:%M:%S")
+        hex_part = " ".join(f"{b:02X}" for b in raw_bytes)
+        line = f"[{ts}] {tag:<3} {hex_part}\n"
+        self.txt_monitor.configure(state="normal")
+        self.txt_monitor.insert("end", line)
+        num_lines = int(self.txt_monitor.index("end-1c").split(".")[0])
+        if num_lines > 300:
+            self.txt_monitor.delete("1.0", f"{num_lines - 300}.0")
+        self.txt_monitor.see("end")
+        self.txt_monitor.configure(state="disabled")
+
+    def _start_reader(self):
+        self.reader_running = True
+        self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.reader_thread.start()
+        self._poll_rx()
+
+    def _stop_reader(self):
+        self.reader_running = False
+        if self.reader_thread:
+            self.reader_thread.join(timeout=1.0)
+            self.reader_thread = None
+
+    def _reader_loop(self):
+        while self.reader_running:
+            try:
+                if self.ser and self.ser.is_open:
+                    data = self.ser.read(64)
+                    if data:
+                        self.rx_queue.put(data)
+                else:
+                    time.sleep(0.05)
+            except Exception as e:
+                self.rx_queue.put(("__ERROR__", str(e)))
+                time.sleep(0.2)
+
+    def _poll_rx(self):
+        try:
+            while True:
+                item = self.rx_queue.get_nowait()
+                if isinstance(item, tuple) and item[0] == "__ERROR__":
+                    print(f"Read error: {item[1]}")
+                else:
+                    self.log_monitor(item, "RX")
+        except queue.Empty:
+            pass
+        if self.reader_running:
+            self.root.after(50, self._poll_rx)
+
     def get_ports(self):
         ports = [port.device for port in serial.tools.list_ports.comports()]
         return ports if ports else ["COM1", "COM3", "/dev/ttyUSB0"]
@@ -77,6 +148,7 @@ class AltLightControllerGUI:
             if self._pending_after_id is not None:
                 self.root.after_cancel(self._pending_after_id)
                 self._pending_after_id = None
+            self._stop_reader()
             self.ser.close()
             self.btn_connect.config(text="Connect")
             messagebox.showinfo("Status", "Disconnected from device.")
@@ -87,8 +159,9 @@ class AltLightControllerGUI:
                 messagebox.showwarning("Error", "Please select a COM port.")
                 return
             try:
-                self.ser = serial.Serial(port, int(baud), timeout=1)
+                self.ser = serial.Serial(port, int(baud), timeout=0.2)
                 time.sleep(0.15)  # let the controller settle after the port opens
+                self._start_reader()
                 self.btn_connect.config(text="Disconnect")
                 self.send_all_channels() # Send initial zeroes on connect
             except Exception as e:
@@ -196,8 +269,10 @@ class AltLightControllerGUI:
         
         try:
             self.ser.write(msg)
+            self.log_monitor(msg, "TX")
         except Exception as e:
             print(f"Write error: {e}")
+            self.log_monitor(f"WRITE ERROR: {e}".encode(), "TX")
 
 if __name__ == "__main__":
     root = tk.Tk()
