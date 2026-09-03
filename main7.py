@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
+import time
 import serial
 import serial.tools.list_ports
 
@@ -28,7 +29,7 @@ class AltLightControllerGUI:
             self.port_cb.current(0)
 
         ttk.Label(conn_frame, text="Baud:").grid(row=0, column=2, padx=2)
-        self.baud_cb = ttk.Combobox(conn_frame, values=["9600", "19200", "38400", "115200"], width=8)
+        self.baud_cb = ttk.Combobox(conn_frame, values=["9600", "19200"], width=8, state="readonly")
         self.baud_cb.set("19200") # ALT default is usually 19200
         self.baud_cb.grid(row=0, column=3, padx=2)
 
@@ -42,6 +43,14 @@ class AltLightControllerGUI:
         ttk.Label(mode_frame, text="Select Mode:", font=("Arial", 9, "bold")).pack(side="left", padx=5)
         ttk.Radiobutton(mode_frame, text="4 Channels", variable=self.num_channels, value=4, command=self.build_sliders).pack(side="left", padx=5)
         ttk.Radiobutton(mode_frame, text="8 Channels", variable=self.num_channels, value=8, command=self.build_sliders).pack(side="left", padx=5)
+
+        ttk.Label(
+            self.root,
+            text="Your unit's label reads ALT-E4RS -- \"E4\" is a fixed 4-channel model. "
+                 "8-Channel mode sends a longer packet that a 4-channel unit isn't built "
+                 "to parse -- only use it if you actually have the 8-channel (E8) unit.",
+            foreground="#b45309", font=("Arial", 8), wraplength=440, justify="left"
+        ).pack(fill="x", padx=10, pady=(0, 5))
 
         # --- Channel Controls ---
         self.ctrl_frame = ttk.LabelFrame(self.root, text=" Channel Brightness (0 - 255) ", padding=10)
@@ -68,6 +77,7 @@ class AltLightControllerGUI:
                 return
             try:
                 self.ser = serial.Serial(port, int(baud), timeout=1)
+                time.sleep(0.15)  # let the controller settle after the port opens
                 self.btn_connect.config(text="Disconnect")
                 self.send_all_channels() # Send initial zeroes on connect
             except Exception as e:
