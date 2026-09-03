@@ -14,7 +14,15 @@ class AltLightControllerGUI:
         self.ser = None
         self.num_channels = tk.IntVar(value=4) # Default 4 channels
         self.channel_values = [0] * 16 # Store max possible channel values
-        
+
+        # The real ALT-side implementation enforces a 100ms minimum gap between
+        # commands (Thread.Sleep in its TurnOn()) -- rapid slider drags were
+        # firing far faster than that, which the controller can drop/ignore.
+        # These track that throttling on the Python side (non-blocking, so the
+        # UI doesn't freeze the way a literal time.sleep() in the callback would).
+        self._last_send_time = 0.0
+        self._pending_after_id = None
+
         self.setup_ui()
 
     def setup_ui(self):
@@ -66,6 +74,9 @@ class AltLightControllerGUI:
 
     def toggle_connection(self):
         if self.ser and self.ser.is_open:
+            if self._pending_after_id is not None:
+                self.root.after_cancel(self._pending_after_id)
+                self._pending_after_id = None
             self.ser.close()
             self.btn_connect.config(text="Connect")
             messagebox.showinfo("Status", "Disconnected from device.")
@@ -130,7 +141,34 @@ class AltLightControllerGUI:
     def send_all_channels(self):
         if not (self.ser and self.ser.is_open):
             return
-            
+
+        now = time.monotonic()
+        elapsed_ms = (now - self._last_send_time) * 1000.0
+
+        if elapsed_ms < 100:
+            # Too soon since the last real send. Rather than sending anyway
+            # (which the real 100ms-gap requirement says the controller may
+            # drop) or blocking the UI with time.sleep(), schedule exactly one
+            # follow-up send for whenever the gap will be satisfied. Any
+            # further slider moves before then just get folded into that one
+            # pending send (it always reads self.channel_values fresh when it
+            # fires), so a fast drag ends with one final, accurate update
+            # instead of a queue of stale ones.
+            if self._pending_after_id is None:
+                delay_ms = int(100 - elapsed_ms) + 1
+                self._pending_after_id = self.root.after(delay_ms, self._do_send)
+            return
+
+        self._do_send()
+
+    def _do_send(self):
+        self._pending_after_id = None
+
+        if not (self.ser and self.ser.is_open):
+            return
+
+        self._last_send_time = time.monotonic()
+
         count = self.num_channels.get()
         current_vals = self.channel_values[:count]
         
