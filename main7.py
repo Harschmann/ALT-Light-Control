@@ -3,8 +3,46 @@ from tkinter import ttk, messagebox
 import time
 import threading
 import queue
+import socket
 import serial
 import serial.tools.list_ports
+
+
+class TcpTransport:
+    """
+    Thin wrapper that mimics a pyserial Serial object's interface
+    (is_open / write / read / close) over a plain TCP socket, so all the
+    existing send/receive/monitor code (which only ever calls
+    self.ser.write/.read/.is_open/.close) works unchanged whether the
+    connection is RS-232 or the controller's Ethernet interface.
+    """
+    def __init__(self, ip, port, timeout=0.2):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(5.0)  # connect timeout
+        self.sock.connect((ip, port))
+        self.sock.settimeout(timeout)  # read timeout once connected
+        self.is_open = True
+
+    def write(self, data):
+        self.sock.sendall(data)
+
+    def read(self, n):
+        try:
+            data = self.sock.recv(n)
+            return data if data else b""
+        except socket.timeout:
+            return b""
+        except OSError:
+            return b""
+
+    def close(self):
+        self.is_open = False
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
 
 class AltLightControllerGUI:
     def __init__(self, root):
@@ -33,22 +71,47 @@ class AltLightControllerGUI:
 
     def setup_ui(self):
         # --- Connection Setup ---
-        conn_frame = ttk.LabelFrame(self.root, text=" Serial Connection ", padding=10)
+        conn_frame = ttk.LabelFrame(self.root, text=" Connection ", padding=10)
         conn_frame.pack(fill="x", padx=10, pady=5)
 
-        ttk.Label(conn_frame, text="Port:").grid(row=0, column=0, padx=2)
-        self.port_cb = ttk.Combobox(conn_frame, values=self.get_ports(), width=10)
+        type_row = ttk.Frame(conn_frame)
+        type_row.pack(fill="x", pady=(0, 5))
+        ttk.Label(type_row, text="Type:").pack(side="left")
+        self.conn_type = tk.StringVar(value="Ethernet (TCP)")
+        self.conn_type_cb = ttk.Combobox(
+            type_row, textvariable=self.conn_type,
+            values=["Ethernet (TCP)", "Serial (RS-232)"], state="readonly", width=16
+        )
+        self.conn_type_cb.pack(side="left", padx=5)
+        self.conn_type_cb.bind("<<ComboboxSelected>>", lambda e: self.on_conn_type_change())
+
+        # Serial fields
+        self.serial_frame = ttk.Frame(conn_frame)
+        ttk.Label(self.serial_frame, text="Port:").grid(row=0, column=0, padx=2)
+        self.port_cb = ttk.Combobox(self.serial_frame, values=self.get_ports(), width=10)
         self.port_cb.grid(row=0, column=1, padx=2)
         if self.port_cb['values']:
             self.port_cb.current(0)
-
-        ttk.Label(conn_frame, text="Baud:").grid(row=0, column=2, padx=2)
-        self.baud_cb = ttk.Combobox(conn_frame, values=["9600", "19200"], width=8, state="readonly")
+        ttk.Label(self.serial_frame, text="Baud:").grid(row=0, column=2, padx=2)
+        self.baud_cb = ttk.Combobox(self.serial_frame, values=["9600", "19200"], width=8, state="readonly")
         self.baud_cb.set("19200") # ALT default is usually 19200
         self.baud_cb.grid(row=0, column=3, padx=2)
 
+        # Ethernet fields
+        self.tcp_frame = ttk.Frame(conn_frame)
+        ttk.Label(self.tcp_frame, text="IP:").grid(row=0, column=0, padx=2)
+        self.ip_entry = ttk.Entry(self.tcp_frame, width=15)
+        self.ip_entry.insert(0, "192.168.10.10")
+        self.ip_entry.grid(row=0, column=1, padx=2)
+        ttk.Label(self.tcp_frame, text="Port:").grid(row=0, column=2, padx=2)
+        self.tcp_port_entry = ttk.Entry(self.tcp_frame, width=8)
+        self.tcp_port_entry.insert(0, "1000")
+        self.tcp_port_entry.grid(row=0, column=3, padx=2)
+
+        self.on_conn_type_change()
+
         self.btn_connect = ttk.Button(conn_frame, text="Connect", command=self.toggle_connection)
-        self.btn_connect.grid(row=0, column=4, padx=5)
+        self.btn_connect.pack(fill="x", pady=5)
 
         # --- Mode Selection ---
         mode_frame = ttk.Frame(self.root)
@@ -167,6 +230,14 @@ class AltLightControllerGUI:
         ports = [port.device for port in serial.tools.list_ports.comports()]
         return ports if ports else ["COM1", "COM3", "/dev/ttyUSB0"]
 
+    def on_conn_type_change(self):
+        if self.conn_type.get().startswith("Serial"):
+            self.tcp_frame.pack_forget()
+            self.serial_frame.pack(fill="x")
+        else:
+            self.serial_frame.pack_forget()
+            self.tcp_frame.pack(fill="x")
+
     def toggle_connection(self):
         if self.ser and self.ser.is_open:
             if self._pending_after_id is not None:
@@ -177,18 +248,28 @@ class AltLightControllerGUI:
             self.btn_connect.config(text="Connect")
             messagebox.showinfo("Status", "Disconnected from device.")
         else:
-            port = self.port_cb.get()
-            baud = self.baud_cb.get()
-            if not port:
-                messagebox.showwarning("Error", "Please select a COM port.")
-                return
             try:
-                self.ser = serial.Serial(port, int(baud), timeout=0.2)
-                time.sleep(0.15)  # let the controller settle after the port opens
+                if self.conn_type.get().startswith("Ethernet"):
+                    ip = self.ip_entry.get().strip()
+                    tcp_port = int(self.tcp_port_entry.get().strip())
+                    if not ip:
+                        messagebox.showwarning("Error", "Please enter the controller's IP address.")
+                        return
+                    self.ser = TcpTransport(ip, tcp_port, timeout=0.2)
+                else:
+                    port = self.port_cb.get()
+                    baud = self.baud_cb.get()
+                    if not port:
+                        messagebox.showwarning("Error", "Please select a COM port.")
+                        return
+                    self.ser = serial.Serial(port, int(baud), timeout=0.2)
+
+                time.sleep(0.15)  # let the controller settle after the connection opens
                 self._start_reader()
                 self.btn_connect.config(text="Disconnect")
                 self.send_all_channels() # Send initial zeroes on connect
             except Exception as e:
+                self.ser = None
                 messagebox.showerror("Connection Error", str(e))
 
     def build_sliders(self):
@@ -288,8 +369,8 @@ class AltLightControllerGUI:
         checksum ^= last_val_plus_one
         
         msg.append(checksum)
-        msg.append(0xEE) 
-        msg.append(0xEE) 
+        msg.append(0xEE) # Footer
+        msg.append(0xEE) # Footer
         
         try:
             self.ser.write(msg)
